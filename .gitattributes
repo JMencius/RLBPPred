@@ -1,0 +1,2 @@
+# The PDB example is the original, checksum-verified RCSB deposit (fixed-width records).
+examples/1UBQ.pdb -text whitespace=-trailing-space

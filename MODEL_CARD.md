@@ -2,18 +2,19 @@
 
 Maintainer and publisher: callmest. Model ID: `strict-saprot-af2-mlp-v1`.
 
-Software [v0.2.1](https://github.com/callmest/RLBPPred/releases/tag/v0.2.1)
-uses the unchanged pretrained files from
+This development checkout uses the same pretrained files as software
+[v0.2.1](https://github.com/callmest/RLBPPred/releases/tag/v0.2.1), from
 [model release v0.2.0](https://github.com/callmest/RLBPPred/releases/tag/v0.2.0).
 Training and paper reproduction are in
 [callmest/RLBPPred-paper-code](https://github.com/callmest/RLBPPred-paper-code).
 
 ## Intended use
 
-Research prioritization of possible R-loop-associated/binding proteins from
-exactly matching SaProt-650M-AF2 global-mean representations. Not a clinical
-test or proof of direct physical binding. No training occurs during installation,
-feature extraction or prediction.
+Research prioritization of possible R-loop-associated/binding proteins. The
+paper used global-mean SaProt-650M-AF2 representations from AFDB structures.
+Scoring local experimental structures is an exploratory extension that uses the
+same encoder, scaler and ensemble; the model was not retrained on experimental
+coordinates. No score is a clinical result or proof of direct physical binding.
 
 ## Training provenance and fixed inference
 
@@ -47,11 +48,15 @@ MLP weights are MIT licensed, without warranty.
 
 ## Limits
 
-Domain shifts, annotation biases, incomplete labels, species transfer and
-dependence on structure quality can affect interpretation. AFDB availability
-is not guaranteed; arbitrary FASTA without a matching AF2 structure cannot be
-processed by this wrapper. Experimental structures and AF3 models are not
-silently treated as AF2. No sequence-only fallback, fragment merging, implicit
-truncation or long-sequence chunk averaging is used. CPU biological regression
-and software tests are described in VALIDATION.md; no CUDA equivalence claim or
-full human/mouse rerun is made by this packaging release.
+AFDB availability is not guaranteed. FASTA input requires an exact matching
+full-length AFDB record; a local structure is a separate input, not a fallback
+to pair with a FASTA. No sequence-only fallback or fragment merging is used.
+
+For AF2 input, the encoder masks structural tokens at residues with mean
+atomic pLDDT below 70. Experimental temperature factors do not measure pLDDT;
+the experimental route does not apply this mask. An experimental score refers
+to the selected modeled chain and need not represent the full-length protein.
+Equivalent predictive accuracy across structure types has not been established.
+In particular, neither the empirical human FPR above nor the 0.98 cutoff was
+validated on experimental structures. Annotation biases, incomplete labels,
+species differences and structure quality may also affect results.

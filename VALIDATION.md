@@ -1,8 +1,30 @@
-# Local acceptance on 9 November 2026
+# Inference software validation
+
+## Independent FASTA and structure inputs (0.3.0.dev0, 25 November 2026)
+
+The following CPU runs used the actual Foldseek executable, fixed SaProt
+checkpoint and strict 300-member MLP, without retraining:
+
+| Input and comparison | Result |
+|---|---|
+| LIG4: online UniProt FASTA versus the same AFDB v6 file supplied to `--pdb` | All 911 AA+3Di pairs and all 1,280 embedding values were identical; both scored 0.9912150100866953. |
+| Historical LIG4 AF2 file supplied to `--pdb` versus the previous packaging run on the same file | All tokens matched; maximum feature difference 5.96 × 10⁻⁸. New score 0.9892950220902761 vs archived run 0.9892949765920639 (absolute difference 4.55 × 10⁻⁸; tolerance 10⁻⁶). The historical and v6 coordinates are different inputs. |
+| Included experimental ubiquitin structure (1UBQ:A, 76 residues) | Completed without FASTA or AFDB. Replacing every B-factor with 0 or 99 left all 76 AA+3Di pairs unchanged. |
+
+These are software checks, not an estimate of accuracy on experimental
+structures or a recalibration of the 0.98 threshold. CLI tests also reject
+combined FASTA/local structure arguments, including on the `predict-fasta` alias.
+
+## Historical acceptance on 9 November 2026
 
 This is software-packaging acceptance evidence for v0.2.0, not an additional
 biological validation experiment. Publication transport and CI status are
 separate checks from model equivalence.
+
+These are historical checks of the releases named below. References to an
+offline FASTA workflow describe the old implementation, not a supported
+combination of FASTA and local structures in the current source checkout.
+They do not validate biological performance on experimental PDB structures.
 
 ## Installation and interfaces
 

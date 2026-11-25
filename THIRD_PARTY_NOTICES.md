@@ -19,6 +19,11 @@ from their upstream publishers; their original terms apply.
   and metadata are retrieved from the official service and retain its terms
   and provenance. Cite the upstream work when using these representations or
   structures in a publication.
+- The included experimental structure [PDB 1UBQ](https://www.rcsb.org/structure/1UBQ)
+  is provided by the worldwide Protein Data Bank under its
+  [CC0 1.0 public domain dedication](https://www.wwpdb.org/about/usage-policies).
+  The original authors are S. Vijay-Kumar, C. E. Bugg and W. J. Cook; see
+  [example provenance](examples/README.md) for the citation and file checksum.
 
 SaProt source notice:
 

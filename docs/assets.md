@@ -1,13 +1,14 @@
 # Fixed assets and offline setup
 
-The current software is **v0.2.1** in [callmest/RLBPPred](https://github.com/callmest/RLBPPred).
-The frozen MLP assets remain in **model release v0.2.0** in that repository;
+This source checkout and the released v0.2.1 software use the same pretrained
+assets. The frozen MLP files are in **model release v0.2.0** in
+[callmest/RLBPPred](https://github.com/callmest/RLBPPred);
 their file contents, sizes and hashes are unchanged. Training and paper
 reproduction are maintained separately in
 [callmest/RLBPPred-paper-code](https://github.com/callmest/RLBPPred-paper-code).
 
 `rlbppred setup` is the only automatic weight-download step. Prediction downloads
-only explicitly permitted AFDB structures when local structures are absent.
+only AFDB structures for FASTA input. Local PDB prediction needs no structure download.
 Weights are never trained or replaced automatically. The setup command checks
 the following fixed sizes and SHA-256 values, including existing cached files.
 
@@ -86,7 +87,9 @@ Downloaded files are streamed and verified before atomic publication. An
 existing corrupt file or symbolic link fails; move it aside deliberately before
 retrying. Nothing is deleted or overwritten as an automatic repair.
 
-To move to an offline machine, copy the verified assets plus exact AF2 structures
-and their metadata. Run `predict-fasta --structure-dir ... --offline ...` there.
-Record checksums/versions with results. Current AFDB metadata is saved per run;
-the online service is not a frozen structural snapshot.
+To use an offline machine, install dependencies and copy the verified assets
+plus a local structure there. Run
+`rlbppred predict --pdb protein.pdb --output-dir results_pdb`; specify
+`--chain` for a file with several protein chains. No FASTA is required.
+For online FASTA runs, AFDB metadata and checksums are recorded; the live
+service is not a frozen structural snapshot.

@@ -1,9 +1,4 @@
-"""Strict FASTA, AlphaFold structure and Foldseek 3Di preparation.
-
-No structure is predicted here. AlphaFold DB retrieval is accession-based;
-unmatched/new sequences need an explicitly supplied, sequence-matched AF2
-structure. Inputs are never silently truncated, replaced or skipped.
-"""
+"""Prepare Foldseek 3Di from accession-matched AFDB or standalone coordinates."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -136,74 +131,136 @@ def _fetch_bytes(url, *, api=False, max_bytes=100_000_000):
     return content
 
 
-def _af2_local_identity(path):
-    # AFDB exports identify their prediction source in PDB headers or mmCIF
-    # metadata. A deliberately supplied sidecar can declare a custom AF2 export.
-    with path.open('rb') as stream:
-        header = stream.read(131072).decode('utf-8', errors='replace').upper()
-    if _AF2.search(header):
-        return {'confidence_source': 'AF2 structure metadata', 'bfactor_is_plddt': True}
+_EXPERIMENT = re.compile(r'\b(?:DIFFRACTION|NMR|MICROSCOPY|SCATTERING|CRYSTALLOGRAPHY|TRANSFER|TOMOGRAPHY)\b')
+_OTHER_PREDICTOR = re.compile(r'ALPHAFOLD[\s_-]*3\b|\bESMFOLD\b|\bROSETTAFOLD\w*\b|\bBOLTZ\b')
+
+
+def _local_identity(path, source):
+    """Recognize declared structure origin, never infer it from numeric B-values."""
+    if source not in ('auto', 'af2', 'experimental'):
+        raise ValueError('structure-source must be auto, af2 or experimental')
+    if path.suffix.lower() == '.pdb':
+        titles, methods = [], []
+        with path.open(encoding='ascii', errors='replace') as inp:
+            for line in inp:
+                tag = line[:6].strip()
+                if tag in ('ATOM', 'HETATM', 'MODEL'):
+                    break
+                if tag in ('TITLE', 'HEADER', 'EXPDTA'):
+                    (methods if tag == 'EXPDTA' else titles).append(line[6:].strip().upper())
+    else:
+        from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+        meta = MMCIF2Dict(str(path))
+        methods = [v.upper() for v in meta.get('_exptl.method', ())]
+        titles = [v.upper() for v in meta.get('_struct.title', ())]
+        names = meta.get('_software.name', ())
+        versions = meta.get('_software.version', ())
+        titles.extend((name + ' ' + (versions[i] if i < len(versions) else '')).upper()
+                      for i, name in enumerate(names))
+    header = ' '.join(titles + methods)
+    recognized = None
+    if any(_EXPERIMENT.search(m) for m in methods):
+        recognized = 'experimental'
+    elif _OTHER_PREDICTOR.search(header):
+        raise ValueError('Unsupported prediction method: expected AlphaFold2 or an experimental structure')
+    elif _AF2.search(header):
+        recognized = 'af2'
+    theoretical = any('THEORETICAL' in m or 'COMPUT' in m for m in methods)
+    metadata = {}
+    declared = None
     sidecar = Path(str(path) + '.json')
     if sidecar.is_file() and not sidecar.is_symlink():
-        declaration = json.loads(sidecar.read_text())
-        if (declaration.get('structure_source') in ('alphafold2', 'af2')
-                and declaration.get('bfactor_is_plddt') is True):
-            return {'confidence_source': 'user-declared AF2 sidecar',
-                    'bfactor_is_plddt': True, 'sidecar_sha256': _digest(sidecar)}
-    raise ValueError(f'{path.name}: local structure is not identified as AF2 with pLDDT in B-factors; '
-                     'experimental B-factors are not pLDDT')
+        declaration = json.loads(sidecar.read_text(encoding='utf-8'))
+        if not isinstance(declaration, dict):
+            raise ValueError('Expected a JSON object in the structure sidecar')
+        origin = declaration.get('structure_source')
+        if origin in ('alphafold2', 'af2') and declaration.get('bfactor_is_plddt') is True:
+            declared = 'af2'
+        elif origin == 'experimental' and declaration.get('bfactor_is_plddt', False) is False:
+            declared = 'experimental'
+        else:
+            raise ValueError('Invalid structure sidecar source or pLDDT declaration')
+        metadata['sidecar_sha256'] = _digest(sidecar)
+    origins = {s for s in (recognized, declared, source if source != 'auto' else None) if s}
+    if len(origins) > 1 or (theoretical and 'experimental' in origins):
+        raise ValueError('Conflicting structure source in coordinate metadata, sidecar or --structure-source')
+    if not origins:
+        raise ValueError('Unknown structure source. Set --structure-source af2 only for AF2 with pLDDT '
+                         'in B-factors, or --structure-source experimental for experimental coordinates.')
+    kind = origins.pop()
+    return {**metadata, 'structure_source': kind, 'bfactor_is_plddt': kind == 'af2',
+            'source_evidence': 'structure metadata' if recognized else ('sidecar' if declared else 'command line')}
 
 
-def _matching_chain(path, expected_sequence):
+def _model(path):
     try:
         from Bio.PDB import MMCIFParser, PDBParser
         from Bio.PDB.PDBExceptions import PDBConstructionException
     except ImportError as exc:
         raise RuntimeError('Biopython is required; install the fasta package extra') from exc
-    import numpy as np
-    parser = MMCIFParser(QUIET=True) if path.suffix.lower() in ('.cif', '.mmcif') else PDBParser(QUIET=True)
+    parser = MMCIFParser(QUIET=True) if path.suffix.lower() in ('.cif', '.mmcif') else PDBParser(PERMISSIVE=False, QUIET=True)
     try:
         structure = parser.get_structure('input', str(path))
         models = list(structure.get_models())
         if len(models) != 1:
             raise ValueError('Exactly one structure model is required')
-        matches = []
-        observed_lengths = []
-        for chain in models[0]:
-            sequence, confidence = [], []
-            for residue in chain:
-                if residue.id[0] != ' ':
-                    continue
-                name = residue.get_resname().upper()
-                if name not in _THREE_TO_ONE:
-                    raise ValueError(f'Nonstandard protein residue {name} in chain {chain.id}')
-                if residue.is_disordered():
-                    raise ValueError('Disordered residue/alternate locations are unsupported')
-                atoms = list(residue.get_atoms())
-                if not atoms or any(atom.is_disordered() for atom in atoms):
-                    raise ValueError('Missing or alternate-location atoms are unsupported')
-                values = [float(atom.get_bfactor()) for atom in atoms]
-                if any(not math.isfinite(v) or not 0 <= v <= 100 for v in values):
-                    raise ValueError('pLDDT values must be finite and in [0, 100]')
-                sequence.append(_THREE_TO_ONE[name])
-                confidence.append(float(np.mean(values)))
-            observed = ''.join(sequence)
-            if not observed:
-                continue
-            observed_lengths.append(len(observed))
-            if observed == expected_sequence:
-                chain_id = str(chain.id)
-                if not re.fullmatch(r'[A-Za-z0-9]+', chain_id):
-                    raise ValueError('Blank or special-character chain identifiers are unsupported')
-                matches.append((chain_id, confidence))
-        if len(matches) != 1:
-            if matches:
-                raise ValueError('Multiple chains exactly match FASTA; chain choice is ambiguous')
-            raise ValueError(f'No complete structure chain exactly matches FASTA '
-                             f'(FASTA length {len(expected_sequence)}, structure chain lengths {observed_lengths})')
-        return matches[0]
+        return models[0]
     except (KeyError, TypeError, OSError, PDBConstructionException) as exc:
         raise ValueError(f'{path.name}: cannot parse a valid structure: {exc}') from exc
+
+
+def _protein_like(residue):
+    from Bio.PDB.Polypeptide import is_aa
+    return is_aa(residue) or all(key in residue for key in ('CA', 'N', 'C'))
+
+
+def _read_chain(chain, af2):
+    import numpy as np
+    if not re.fullmatch(r'[A-Za-z0-9]+', chain.id):
+        raise ValueError('Blank or special-character chain identifiers are unsupported')
+    sequence, confidence, residue_ids = [], [], []
+    for residue in chain:
+        flag, number, ins = residue.id
+        name = residue.get_resname().upper()
+        if flag.strip() and not _protein_like(residue):
+            continue  # solvent, nucleotides in hetero records, bound ligands
+        if flag.strip() or name not in _THREE_TO_ONE:
+            raise ValueError(f'Nonstandard protein residue {name} in chain {chain.id}; cannot silently skip it')
+        if residue.is_disordered():
+            raise ValueError('Alternate locations/ambiguous residues: select a single conformer before scoring')
+        atoms = list(residue.get_atoms())
+        if 'CA' not in residue or any(atom.is_disordered() for atom in atoms):
+            raise ValueError('Missing C-alpha or alternate-location atoms are unsupported')
+        if residue_ids and number not in (residue_ids[-1][0], residue_ids[-1][0]+1):
+            raise ValueError(f'Noncontiguous residue numbering in chain {chain.id}: scoring across a '
+                             'possible missing internal segment is unsupported')
+        residue_ids.append((number, ins.strip()))
+        sequence.append(_THREE_TO_ONE[name])
+        if af2:
+            values = [float(atom.get_bfactor()) for atom in atoms]
+            if any(not math.isfinite(v) or not 0 <= v <= 100 for v in values):
+                raise ValueError('pLDDT values must be finite and in [0, 100]')
+            confidence.append(float(np.mean(values)))
+    if not sequence:
+        raise ValueError(f'No observed protein residues in chain {chain.id}')
+    return ''.join(sequence), confidence if af2 else None, [f'{n}{ins}' for n, ins in residue_ids]
+
+
+def _matching_chain(path, expected_sequence):
+    matches, lengths = [], []
+    for chain in _model(path):
+        if not any(_protein_like(res) for res in chain):
+            continue
+        observed, confidence, _ = _read_chain(chain, af2=True)
+        lengths.append(len(observed))
+        if observed == expected_sequence:
+            matches.append((chain.id, confidence))
+    if len(matches) != 1:
+        if matches:
+            raise ValueError('Multiple chains exactly match FASTA; chain choice is ambiguous')
+        raise ValueError(f'No complete structure chain exactly matches FASTA '
+                         f'(FASTA length {len(expected_sequence)}, structure chain lengths {lengths})')
+    return matches[0]
 
 
 def _select_afdb_record(payload, protein, sequence):
@@ -234,73 +291,46 @@ def _select_afdb_record(payload, protein, sequence):
     return matches[0]
 
 
-def resolve_structures(records, workdir, structure_dir=None, source='alphafold', offline=False):
-    """Resolve exact sequence-matched AF2 chains, returning ordered dictionaries.
-
-    The caller's run directory may already exist; ``structures/`` must not.
-    Local ID.pdb/ID.cif inputs are copied, never changed. With ``offline=True``
-    or ``source='local'``, missing local files fail without making a request.
-    """
+def resolve_structures(records, workdir):
+    """Remote-only FASTA route: require one exact full-length AFDB AF2 entry per accession."""
     _validate_records(records)
-    if source not in ('alphafold', 'local'):
-        raise ValueError('Structure source must be alphafold or local')
-    if structure_dir is not None:
-        structure_dir = Path(structure_dir).expanduser().resolve(strict=True)
-        if not structure_dir.is_dir():
-            raise ValueError('structure-dir must be a directory')
-    if (offline or source == 'local') and structure_dir is None:
-        raise ValueError('Offline/local operation requires structure-dir')
     destination = _new_subdir(workdir, 'structures')
     resolved = []
     for protein, sequence in records:
-        local = [] if structure_dir is None else [
-            structure_dir / (protein + suffix) for suffix in ('.pdb', '.cif', '.mmcif')
-            if (structure_dir / (protein + suffix)).is_file()]
-        if len(local) > 1:
-            raise ValueError(f'{protein}: multiple local structure files; provide only one')
-        if local:
-            identity = _af2_local_identity(local[0])
-            path = destination / (protein + local[0].suffix.lower())
-            with path.open('xb') as target, local[0].open('rb') as source_stream:
-                shutil.copyfileobj(source_stream, target)
-            chain, confidence = _matching_chain(path, sequence)
-            provenance = {'source': 'local_alphafold', 'source_file': local[0].name, **identity}
-        else:
-            if offline or source == 'local':
-                raise ValueError(f'{protein}: local AF2 structure is missing; offline mode forbids downloading')
-            if not _UNIPROT.fullmatch(protein):
-                raise ValueError(f'{protein}: AFDB retrieval requires a UniProt accession; '
-                                 'provide a sequence-matched local AF2 structure for arbitrary identifiers')
-            api_url = AFDB_API + quote(protein, safe='')
-            raw = _fetch_bytes(api_url, api=True, max_bytes=20_000_000)
-            try:
-                row = _select_afdb_record(json.loads(raw), protein, sequence)
-            except (json.JSONDecodeError, UnicodeError) as exc:
-                raise ValueError(f'{protein}: invalid AlphaFold DB metadata JSON') from exc
-            with (destination / (protein + '.afdb.json')).open('xb') as target:
-                target.write(raw)
-            url = row.get('pdbUrl') or row.get('cifUrl')
-            if not isinstance(url, str):
-                raise ValueError(f'{protein}: AFDB did not provide a structure URL')
-            _checked_url(url)
-            suffix = Path(urlparse(url).path).suffix.lower()
-            if suffix not in ('.pdb', '.cif', '.mmcif'):
-                raise ValueError(f'{protein}: unsupported structure file format')
-            entry_id = row.get('entryId', row.get('modelEntityId'))
-            expected_name = f'{entry_id}-model_v{int(row["latestVersion"])}{suffix}'
-            if Path(urlparse(url).path).name != expected_name:
-                raise ValueError(f'{protein}: structure URL does not match AFDB entry/version metadata')
-            content = _fetch_bytes(url)
-            path = destination / (protein + suffix)
-            with path.open('xb') as target:
-                target.write(content)
-            chain, confidence = _matching_chain(path, sequence)
-            provenance = {'source': 'alphafold_database', 'accession': protein,
-                          'entry_id': entry_id, 'version': int(row['latestVersion']),
-                          'structure_method': row['toolUsed'],
-                          'metadata_url': api_url, 'structure_url': url,
-                          'retrieved_utc': datetime.now(timezone.utc).isoformat(),
-                          'bfactor_is_plddt': True}
+        if not _UNIPROT.fullmatch(protein):
+            raise ValueError(f'{protein}: AFDB retrieval requires a UniProt accession; '
+                             'use --pdb instead to score a local structure')
+        api_url = AFDB_API + quote(protein, safe='')
+        raw = _fetch_bytes(api_url, api=True, max_bytes=20_000_000)
+        try:
+            row = _select_afdb_record(json.loads(raw), protein, sequence)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise ValueError(f'{protein}: invalid AlphaFold DB metadata JSON') from exc
+        with (destination / (protein + '.afdb.json')).open('xb') as target:
+            target.write(raw)
+        url = row.get('pdbUrl') or row.get('cifUrl')
+        if not isinstance(url, str):
+            raise ValueError(f'{protein}: AFDB did not provide a structure URL')
+        _checked_url(url)
+        suffix = Path(urlparse(url).path).suffix.lower()
+        if suffix not in ('.pdb', '.cif', '.mmcif'):
+            raise ValueError(f'{protein}: unsupported structure file format')
+        entry_id = row.get('entryId', row.get('modelEntityId'))
+        expected_name = f'{entry_id}-model_v{int(row["latestVersion"])}{suffix}'
+        if Path(urlparse(url).path).name != expected_name:
+            raise ValueError(f'{protein}: structure URL does not match AFDB entry/version metadata')
+        content = _fetch_bytes(url)
+        path = destination / (protein + suffix)
+        with path.open('xb') as target:
+            target.write(content)
+        chain, confidence = _matching_chain(path, sequence)
+        provenance = {'source': 'alphafold_database', 'structure_source': 'af2', 'sequence_scope': 'full_length_fasta',
+                      'accession': protein,
+                      'entry_id': entry_id, 'version': int(row['latestVersion']),
+                      'structure_method': row['toolUsed'],
+                      'metadata_url': api_url, 'structure_url': url,
+                      'retrieved_utc': datetime.now(timezone.utc).isoformat(),
+                      'bfactor_is_plddt': True}
         provenance.update(structure_sha256=_digest(path), sequence_sha256=_sequence_digest(sequence),
                           length=len(sequence), chain_id=chain, complete_sequence_match=True)
         resolved.append({'protein_id': protein, 'sequence': sequence, 'path': str(path),
@@ -309,6 +339,54 @@ def resolve_structures(records, workdir, structure_dir=None, source='alphafold',
         json.dump([r['provenance'] for r in resolved], target, indent=2, allow_nan=False)
         target.write('\n')
     return resolved
+
+
+def resolve_pdb(path, *, chain=None, source='auto', workdir=None):
+    """Select one observed protein chain from a standalone PDB/mmCIF; no FASTA or network.
+
+    The coordinates alone do not establish full-length canonical protein coverage.
+    With a workdir, retain an immutable run snapshot with its source declaration.
+    """
+    original = Path(path).expanduser().resolve(strict=True)
+    suffix = original.suffix.lower()
+    if not original.is_file() or suffix not in ('.pdb', '.cif', '.mmcif'):
+        raise ValueError('Expected an uncompressed .pdb, .cif or .mmcif coordinate file')
+    stem = re.sub(r'[^A-Za-z0-9_.-]+', '_', original.stem).strip('._-') or 'structure'
+    destination = None
+    path = original
+    if workdir is not None:
+        destination = _new_subdir(workdir, 'structures')
+        path = destination / (stem + suffix)
+        shutil.copyfile(original, path)
+        sidecar = Path(str(original) + '.json')
+        if sidecar.is_file() and not sidecar.is_symlink():
+            shutil.copyfile(sidecar, str(path) + '.json')
+    model = _model(path)
+    identity = _local_identity(path, source)
+    choices = {c.id: c for c in model if any(_protein_like(r) for r in c)}
+    if not choices:
+        raise ValueError('No protein chains found in the coordinate file')
+    available = ', '.join(repr(c) for c in choices)
+    if chain is None:
+        if len(choices) != 1:
+            raise ValueError(f'Multiple protein chains: {available}; specify --chain')
+        chain = next(iter(choices))
+    if chain not in choices:
+        raise ValueError(f'Unknown protein chain {chain!r}; available protein chains: {available}')
+    sequence, confidence, residue_ids = _read_chain(choices[chain], af2=identity['structure_source']=='af2')
+    protein = f'{stem}:{chain}'
+    provenance = {'source': 'local_structure', **identity, 'source_file': original.name,
+                  'structure_sha256': _digest(path), 'sequence_sha256': _sequence_digest(sequence),
+                  'protein_id': protein, 'length': len(sequence), 'chain_id': chain,
+                  'sequence_scope': 'observed_chain', 'full_length_verified': False,
+                  'first_observed_residue': residue_ids[0], 'last_observed_residue': residue_ids[-1],
+                  'model_serial': model.serial_num}
+    if destination is not None:
+        with (destination / 'provenance.json').open('x', encoding='utf-8') as f:
+            json.dump([provenance], f, indent=2, allow_nan=False)
+            f.write('\n')
+    return {'protein_id': protein, 'sequence': sequence, 'path': str(path),
+            'chain_id': chain, 'plddt': confidence, 'provenance': provenance}
 
 
 def make_tokens(resolved, foldseek, workdir, plddt_threshold=70.0):
@@ -333,7 +411,13 @@ def make_tokens(resolved, foldseek, workdir, plddt_threshold=70.0):
         protein, sequence, chain = item['protein_id'], item['sequence'], item['chain_id']
         _validate_records([(protein, sequence)])
         confidence = item['plddt']
-        if len(confidence) != len(sequence) or any(not math.isfinite(v) or not 0 <= v <= 100 for v in confidence):
+        kind = item['provenance']['structure_source']
+        if kind not in ('af2', 'experimental'):
+            raise ValueError(f'{protein}: unknown structure source')
+        if kind == 'experimental' and confidence is not None:
+            raise ValueError(f'{protein}: experimental B-factors must not be supplied as pLDDT')
+        if kind == 'af2' and (confidence is None or len(confidence) != len(sequence) or
+                             any(not math.isfinite(v) or not 0 <= v <= 100 for v in confidence)):
             raise ValueError(f'{protein}: pLDDT coverage does not match the complete sequence')
         path = Path(item['path']).resolve(strict=True)
         if _digest(path) != item['provenance']['structure_sha256']:
@@ -367,21 +451,23 @@ def make_tokens(resolved, foldseek, workdir, plddt_threshold=70.0):
                 raise ValueError(f'{protein}: Foldseek output did not identify exactly the selected structure chain')
             amino_acids, structural = matches[0]
             if amino_acids != sequence or len(structural) != len(sequence):
-                raise ValueError(f'{protein}: Foldseek AA/3Di does not exactly cover the FASTA sequence')
+                raise ValueError(f'{protein}: Foldseek AA/3Di does not exactly cover the selected sequence')
             if set(structural) - STRUCTURE_ALPHABET:
                 raise ValueError(f'{protein}: Foldseek returned unsupported 3Di symbols')
-            masked = ''.join('#' if score < plddt_threshold else symbol
-                             for symbol, score in zip(structural, confidence))
+            masked = (structural if confidence is None else
+                      ''.join('#' if score < plddt_threshold else symbol
+                              for symbol, score in zip(structural, confidence)))
             combined = ''.join(aa + symbol for aa, symbol in zip(sequence, masked))
         records.append((protein, combined))
         rows.append({'protein_id': protein, 'length': len(sequence), 'chain_id': chain,
                      'structure_sha256': item['provenance']['structure_sha256'],
                      'token_sha256': hashlib.sha256(combined.encode('ascii')).hexdigest(),
-                     'masked_residues': sum(score < plddt_threshold for score in confidence),
-                     'plddt_threshold': plddt_threshold})
+                     'structure_source': kind,
+                     'masked_residues': 0 if confidence is None else sum(score < plddt_threshold for score in confidence),
+                     'plddt_threshold': None if confidence is None else plddt_threshold})
     provenance = {'foldseek_version': version.stdout.strip(), 'foldseek_sha256': _digest(binary),
                   'mode': 'structureto3didescriptor', 'chain_name_mode': 1, 'threads': 1,
-                  'plddt_policy': 'mean per-residue atomic B-factor; below threshold masked as #',
+                  'plddt_policy': 'AF2: mask 3Di below the mean per-residue pLDDT cutoff; experimental: no B-factor masking',
                   'records': rows}
     with (destination / 'tokens.fasta').open('x', encoding='ascii') as target:
         for protein, combined in records:

@@ -45,9 +45,8 @@ def local_structure(tmp_path, *, sequence="AC", scores=(69.0, 70.0), chains=("A"
 
 
 def resolved_structure(tmp_path):
-    source, path = local_structure(tmp_path)
-    resolved = structure.resolve_structures([("P49917", "AC")], tmp_path / "run", source, offline=True)
-    return resolved, path
+    _, path = local_structure(tmp_path)
+    return [structure.resolve_pdb(path, workdir=tmp_path / "run")], path
 
 
 def mock_foldseek(tmp_path, monkeypatch, *, descriptor="P49917.pdb_A\tAC\tpy\n", code=0,
@@ -97,49 +96,65 @@ def test_invalid_fasta_is_rejected(tmp_path, text):
         structure.read_fasta(path)
 
 
-def test_complete_local_chain_is_copied_without_changing_input(tmp_path):
-    source, original = local_structure(tmp_path)
+def test_local_chain_is_copied_without_claiming_full_length(tmp_path):
+    _, original = local_structure(tmp_path)
     before = original.read_bytes()
-    resolved = structure.resolve_structures([("P49917", "AC")], tmp_path / "run", source, offline=True)
+    result = structure.resolve_pdb(original, workdir=tmp_path / "run")
     assert original.read_bytes() == before
-    assert resolved[0]["chain_id"] == "A"
-    assert resolved[0]["plddt"] == [69.0, 70.0]
-    assert Path(resolved[0]["path"]).read_bytes() == before
-    assert resolved[0]["provenance"]["structure_sha256"] == hashlib.sha256(before).hexdigest()
-    assert resolved[0]["provenance"]["complete_sequence_match"] is True
+    assert result["sequence"] == "AC"
+    assert result["chain_id"] == "A"
+    assert result["plddt"] == [69.0, 70.0]
+    assert Path(result["path"]).read_bytes() == before
+    assert result["provenance"]["structure_sha256"] == hashlib.sha256(before).hexdigest()
+    assert result["provenance"]["full_length_verified"] is False
+    assert result["provenance"]["sequence_scope"] == "observed_chain"
     assert json.loads((tmp_path / "run/structures/provenance.json").read_text())[0]["length"] == 2
 
 
-def test_local_sequence_mismatch_and_ambiguous_chain_are_rejected(tmp_path):
-    source, _ = local_structure(tmp_path, chains=("A", "B"))
-    with pytest.raises(ValueError, match="Multiple chains"):
-        structure.resolve_structures([("P49917", "AC")], tmp_path / "ambiguous", source, offline=True)
-    with pytest.raises(ValueError, match="No complete structure chain"):
-        structure.resolve_structures([("P49917", "AD")], tmp_path / "mismatch", source, offline=True)
+def test_ambiguous_chain_requires_explicit_choice(tmp_path):
+    _, path = local_structure(tmp_path, chains=("A", "B"))
+    with pytest.raises(ValueError, match="Multiple protein chains: 'A', 'B'"):
+        structure.resolve_pdb(path)
+    assert structure.resolve_pdb(path, chain="B")["protein_id"] == "P49917:B"
+    with pytest.raises(ValueError, match="available protein chains"):
+        structure.resolve_pdb(path, chain="C")
 
 
-def test_experimental_b_factors_are_not_assumed_to_be_plddt(tmp_path):
-    source, path = local_structure(tmp_path, af2=False)
-    with pytest.raises(ValueError, match="experimental B-factors are not pLDDT"):
-        structure.resolve_structures([("P49917", "AC")], tmp_path / "rejected", source, offline=True)
+def test_unknown_source_can_be_declared_but_is_not_guessed_from_b_values(tmp_path):
+    _, path = local_structure(tmp_path, af2=False)
+    with pytest.raises(ValueError, match="Unknown structure source"):
+        structure.resolve_pdb(path)
+    assert structure.resolve_pdb(path, source="experimental")["plddt"] is None
     Path(str(path) + ".json").write_text(json.dumps({"structure_source": "alphafold2", "bfactor_is_plddt": True}))
-    resolved = structure.resolve_structures([("P49917", "AC")], tmp_path / "declared", source, offline=True)
-    assert resolved[0]["provenance"]["confidence_source"] == "user-declared AF2 sidecar"
+    resolved = structure.resolve_pdb(path, workdir=tmp_path/"declared")
+    assert resolved["provenance"]["source_evidence"] == "sidecar"
+    assert resolved["plddt"] == [69., 70.]
+    with pytest.raises(ValueError, match="Conflicting structure source"):
+        structure.resolve_pdb(path, source="experimental")
 
 
-def test_multiple_local_formats_are_not_arbitrarily_selected(tmp_path):
-    source, _ = local_structure(tmp_path)
-    (source / "P49917.cif").write_text("software fixture")
-    with pytest.raises(ValueError, match="multiple local structure"):
-        structure.resolve_structures([("P49917", "AC")], tmp_path / "run", source, offline=True)
+def test_experimental_b_factors_are_not_masked_or_treated_as_confidence(tmp_path, monkeypatch):
+    _, path = local_structure(tmp_path, scores=(2.0, 145.0), af2=False)
+    path.write_bytes(path.read_bytes().replace(b"HEADER    SOFTWARE TEST FIXTURE",
+                    b"HEADER    TEST FIXTURE\nEXPDTA    X-RAY DIFFRACTION"))
+    monkeypatch.setattr(structure, "_fetch_bytes", lambda *a, **k: pytest.fail("PDB made a network request"))
+    result = structure.resolve_pdb(path, workdir=tmp_path/"run")
+    assert result["plddt"] is None and result["provenance"]["bfactor_is_plddt"] is False
+    binary, _ = mock_foldseek(tmp_path, monkeypatch)
+    tokens, meta = structure.make_tokens([result], binary, tmp_path/"run")
+    assert tokens == [("P49917:A", "ApCy")]
+    assert meta["records"][0]["plddt_threshold"] is None
+    assert meta["records"][0]["masked_residues"] == 0
+    with pytest.raises(ValueError, match="Conflicting structure source"):
+        structure.resolve_pdb(path, source="af2")
 
 
-def test_offline_missing_structure_never_attempts_download(tmp_path, monkeypatch):
-    source = tmp_path / "inputs"
-    source.mkdir()
+def test_fasta_route_rejects_nonaccession_and_legacy_local_option(tmp_path, monkeypatch):
     monkeypatch.setattr(structure, "_fetch_bytes", lambda *a, **k: pytest.fail("unexpected network request"))
-    with pytest.raises(ValueError, match="offline mode forbids"):
-        structure.resolve_structures([("P49917", "AC")], tmp_path / "run", source, offline=True)
+    with pytest.raises(ValueError, match="UniProt accession"):
+        structure.resolve_structures([("custom", "AC")], tmp_path / "run")
+    with pytest.raises(TypeError):
+        structure.resolve_structures([("P49917", "AC")], tmp_path / "run", structure_dir=tmp_path)
 
 
 def test_afdb_selection_is_exact_and_not_first_record():
@@ -186,10 +201,10 @@ def test_afdb_version_or_actual_sequence_mismatch_is_rejected(tmp_path, monkeypa
 
 
 def test_af3_local_structure_is_not_accepted_as_af2(tmp_path):
-    source, path = local_structure(tmp_path)
+    _, path = local_structure(tmp_path)
     path.write_bytes(path.read_bytes().replace(b"ALPHAFOLD MONOMER V2.0", b"ALPHAFOLD 3 PREDICTION"))
-    with pytest.raises(ValueError, match="not identified as AF2"):
-        structure.resolve_structures([("P49917", "AC")], tmp_path / "run", source, offline=True)
+    with pytest.raises(ValueError, match="Unsupported prediction method"):
+        structure.resolve_pdb(path, source="af2")
 
 
 @pytest.mark.parametrize("url", ["http://alphafold.ebi.ac.uk/files/A.pdb", "https://example.com/files/A.pdb",
@@ -214,14 +229,14 @@ def test_foldseek_tokens_use_exact_chain_and_mean_atom_plddt_mask(tmp_path, monk
     original = source.read_bytes()
     binary, calls = mock_foldseek(tmp_path, monkeypatch)
     records, provenance = structure.make_tokens(resolved, binary, tmp_path / "run")
-    assert records == [("P49917", "A#Cy")]
+    assert records == [("P49917:A", "A#Cy")]
     assert provenance["records"][0]["masked_residues"] == 1
     assert provenance["foldseek_version"] == "10-test"
     assert provenance["foldseek_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
     assert source.read_bytes() == original
     assert len(calls) == 2
     assert not list((tmp_path / "run/tokens").glob("foldseek-*"))
-    assert (tmp_path / "run/tokens/tokens.fasta").read_text() == ">P49917\nA#Cy\n"
+    assert (tmp_path / "run/tokens/tokens.fasta").read_text() == ">P49917:A\nA#Cy\n"
 
 
 @pytest.mark.parametrize("descriptor", ["P49917.pdb_B\tAC\tpy\n", "P49917.pdb_A\tAD\tpy\n",
@@ -278,23 +293,77 @@ def test_foldseek_timeout_is_clear_failure(tmp_path, monkeypatch):
 
 
 def test_residue_confidence_is_mean_of_all_atomic_b_factors(tmp_path):
-    source, path = local_structure(tmp_path)
+    _, path = local_structure(tmp_path)
     lines = path.read_text().splitlines()
     atom_rows = [i for i, line in enumerate(lines) if line.startswith("ATOM")]
     # First residue has N=68 and CA=72, so its confidence is exactly 70.
     for i, value in zip(atom_rows[:2], [68.0, 72.0]):
         lines[i] = lines[i][:60] + f"{value:6.2f}" + lines[i][66:]
     path.write_text("\n".join(lines) + "\n")
-    resolved = structure.resolve_structures([("P49917", "AC")], tmp_path / "run", source, offline=True)
-    assert resolved[0]["plddt"] == [70.0, 70.0]
+    assert structure.resolve_pdb(path)["plddt"] == [70.0, 70.0]
 
 
 def test_nonstandard_residue_and_incomplete_chains_are_rejected(tmp_path):
-    source, path = local_structure(tmp_path)
+    _, path = local_structure(tmp_path)
     original = path.read_bytes()
     path.write_bytes(original.replace(b"CYS", b"UNK"))
     with pytest.raises(ValueError, match="Nonstandard protein residue"):
-        structure.resolve_structures([("P49917", "AC")], tmp_path / "unknown", source, offline=True)
+        structure.resolve_pdb(path)
     path.write_bytes(original)
     with pytest.raises(ValueError, match="No complete structure chain"):
-        structure.resolve_structures([("P49917", "ACD")], tmp_path / "incomplete", source, offline=True)
+        structure._matching_chain(path, "ACD")
+
+
+def test_remote_and_direct_af2_structure_generate_identical_features_input(tmp_path, monkeypatch):
+    _, path = local_structure(tmp_path)
+    coordinates = path.read_bytes()
+    monkeypatch.setattr(structure, "_fetch_bytes", lambda url, **kw:
+                        json.dumps([api_record()]).encode() if kw.get("api") else coordinates)
+    remote = structure.resolve_structures([("P49917", "AC")], tmp_path / "remote")
+    local = structure.resolve_pdb(path, workdir=tmp_path / "local")
+    binary, _ = mock_foldseek(tmp_path, monkeypatch)
+    remote_tokens, rm = structure.make_tokens(remote, binary, tmp_path / "remote")
+    local_tokens, lm = structure.make_tokens([local], binary, tmp_path / "local")
+    assert remote_tokens[0][1] == local_tokens[0][1] == "A#Cy"
+    assert rm["records"][0]["token_sha256"] == lm["records"][0]["token_sha256"]
+    assert remote[0]["provenance"]["complete_sequence_match"]
+    assert not local["provenance"]["full_length_verified"]
+
+
+@pytest.mark.parametrize("suffix", [".cif", ".mmcif"])
+def test_standalone_experimental_mmcif_author_chains_and_no_bfactor_mask(tmp_path, suffix):
+    from Bio.PDB import MMCIFIO, PDBParser
+    _, path = local_structure(tmp_path, chains=("A", "B"), scores=(98., 123.), af2=False)
+    out = tmp_path / ("experiment" + suffix)
+    io = MMCIFIO()
+    io.set_structure(PDBParser(QUIET=True).get_structure("test", path))
+    io.save(str(out))
+    with out.open("a") as f:
+        f.write("\n_exptl.method 'ELECTRON MICROSCOPY'\n")
+    result = structure.resolve_pdb(out, chain="B")
+    assert (result["sequence"], result["chain_id"], result["plddt"]) == ("AC", "B", None)
+    assert result["provenance"]["structure_source"] == "experimental"
+
+
+def test_pdb_rejects_missing_internal_segment_and_modified_amino_acids(tmp_path):
+    _, path = local_structure(tmp_path)
+    original = path.read_bytes()
+    path.write_bytes(original.replace(b"CYS A   2", b"CYS A  12"))
+    with pytest.raises(ValueError, match="missing internal segment"):
+        structure.resolve_pdb(path)
+    lines = [ln.replace(b"ATOM  ", b"HETATM").replace(b"CYS", b"MSE") if b"CYS" in ln else ln
+             for ln in original.splitlines(keepends=True)]
+    path.write_bytes(b"".join(lines))
+    with pytest.raises(ValueError, match="Nonstandard protein residue MSE"):
+        structure.resolve_pdb(path)
+
+
+def test_pdb_rejects_multiple_models(tmp_path):
+    _, path = local_structure(tmp_path)
+    src = path.read_bytes()
+    first = src.index(b"ATOM")
+    coordinates = src[first:src.index(b"END\n")]
+    path.write_bytes(src[:first] + b"MODEL        1\n" + coordinates + b"ENDMDL\nMODEL        2\n" +
+                     coordinates + b"ENDMDL\nEND\n")
+    with pytest.raises(ValueError, match="Exactly one structure model"):
+        structure.resolve_pdb(path)

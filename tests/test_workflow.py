@@ -93,10 +93,9 @@ def run_pipeline(pipeline, **options):
 
 def test_fasta_to_prediction_preserves_order_and_writes_complete_receipt(pipeline):
     original = pipeline["fasta"].read_bytes()
-    receipt = run_pipeline(pipeline, offline=True, structure_dir=pipeline["fasta"].parent,
-                           structure_source="local", device="cpu", batch_size=7, max_residues=10)
+    receipt = run_pipeline(pipeline, device="cpu", batch_size=7, max_residues=10)
     assert [call[0] for call in pipeline["calls"]] == ["resolve", "tokens", "encode", "load", "predict"]
-    assert pipeline["calls"][0][2] == {"structure_dir": pipeline["fasta"].parent, "source": "local", "offline": True}
+    assert pipeline["calls"][0][2] == {}
     assert pipeline["calls"][2][2]["max_residues"] == 10
     assert pipeline["calls"][4][2]["batch_size"] == 7
     with (pipeline["output"] / "predictions.csv").open() as handle:
@@ -215,11 +214,11 @@ def test_csv_validation_failure_is_not_reported_as_success(pipeline, monkeypatch
     assert not (pipeline["output"] / "predictions.csv").exists()
 
 
-def test_predict_fasta_cli_runs_the_same_pipeline(pipeline, capsys):
-    code = cli.main(["predict-fasta", "--fasta", str(pipeline["fasta"]),
+@pytest.mark.parametrize("command", ["predict-fasta", "predict"])
+def test_predict_fasta_cli_runs_the_same_pipeline(pipeline, capsys, command):
+    code = cli.main([command, "--fasta", str(pipeline["fasta"]),
                      "--output-dir", str(pipeline["output"]), "--assets-dir", str(pipeline["assets"]),
-                     "--model-dir", str(pipeline["bundle"]), "--offline", "--structure-source", "local",
-                     "--structure-dir", str(pipeline["fasta"].parent), "--batch-size", "11",
+                     "--model-dir", str(pipeline["bundle"]), "--batch-size", "11",
                      "--max-residues", "12", "--threshold", "0.99"])
     assert code == 0
     printed = json.loads(capsys.readouterr().out)
@@ -247,7 +246,63 @@ def test_cli_version_is_current(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--version"])
     assert exc.value.code == 0
-    assert capsys.readouterr().out.strip() == "rlbppred 0.2.1"
+    assert capsys.readouterr().out.strip() == "rlbppred " + __version__
+
+
+@pytest.mark.parametrize("command,options", [
+    ("predict", ["--fasta","test.fasta","--pdb","sample.pdb","--output-dir","out"]),
+    ("predict", ["--pdb","sample.pdb","--embeddings","x.npz","--output-dir","out"]),
+    ("predict", ["--fasta","test.fasta","--structure-dir","structures","--output-dir","out"]),
+    ("predict-fasta", ["--fasta","test.fasta","--offline","--output-dir","out"]),
+    ("predict-fasta", ["--fasta","test.fasta","--structure-dir","structures","--output-dir","out"]),
+])
+def test_rejects_mixed_inputs_and_removed_fasta_local_options(command, options):
+    with pytest.raises(SystemExit) as exc:
+        cli.parser().parse_args([command, *options])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("opts,expected", [
+    (["--fasta","x.fa","--output-dir","out","--chain","B"], "--pdb"),
+    (["--fasta","x.fa","--output-dir","out","--structure-source","auto"], "--pdb"),
+    (["--pdb","sample.pdb","--output","out.csv"], "--output-dir"),
+    (["--embeddings","x.npz","--output-dir","out"], "--output"),
+    (["--embeddings","x.npz","--output","scores.csv","--structure-source","af2"], "--pdb"),
+    (["--embeddings","x.npz","--output","scores.csv","--max-residues","150"], "--embeddings"),
+])
+def test_mode_specific_options_do_not_silently_disappear(opts, expected, capsys):
+    assert cli.main(["predict", *opts]) == 2
+    assert expected in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["experimental","af2"])
+def test_pdb_only_pipeline_receipt_and_csv(source, pipeline, monkeypatch, capsys):
+    pdb = pipeline["fasta"].with_suffix(".pdb")
+    pdb.write_bytes(b"coordinate placeholder (parser is stubbed in this test)")
+    score_id = "sample_B"
+    def resolve(path, *, chain, source, workdir):
+        assert path == pdb and chain == "B"
+        assert Path(workdir) == pipeline["output"]
+        return {"protein_id":score_id, "chain_id":"B", "sequence":"AC",
+                "provenance":{"structure_source":source,"sequence_scope":"observed_chain",
+                              "structure_sha256":hashlib.sha256(pdb.read_bytes()).hexdigest()}}
+    monkeypatch.setattr(structure, "resolve_pdb", resolve)
+    monkeypatch.setattr(structure, "read_fasta", lambda *a: pytest.fail("PDB must not read FASTA"))
+    monkeypatch.setattr(structure, "resolve_structures", lambda *a: pytest.fail("PDB must not contact AFDB"))
+    monkeypatch.setattr(structure, "make_tokens", lambda items,*a,**kw: ([(score_id,"ApCp")],{"foldseek_version":"10-test"}))
+    monkeypatch.setattr(encoder,"encode_tokens",lambda *a,**kw: ([score_id],np.zeros((1,1280),np.float32),{"checkpoint_sha256":"test-sha"}))
+    monkeypatch.setattr(runtime,"predict_embeddings",lambda *a,**kw: np.array([0.72]))
+    opts=["predict","--pdb",str(pdb),"--chain","B","--structure-source",source,
+          "--assets-dir",str(pipeline["assets"]),"--model-dir",str(pipeline["bundle"]),
+          "--output-dir",str(pipeline["output"])]
+    assert cli.main(opts)==0
+    capture=capsys.readouterr()
+    receipt=json.loads(capture.out)
+    assert receipt==json.loads((pipeline["output"]/"run.json").read_text())
+    assert (receipt["input_mode"],receipt["structure_source"],receipt["chain_id"],receipt["scored_residues"])==("pdb",source,"B",2)
+    assert (("warning" in receipt) == ("not validated" in capture.err) == (source=="experimental"))
+    assert "fasta_sha256" not in receipt
+    assert (pipeline["output"]/"predictions.csv").read_text().splitlines()[1].startswith(score_id+",0.72,")
 
 
 def test_setup_model_dispatch_uses_requested_asset_cache(tmp_path, monkeypatch, capsys):
