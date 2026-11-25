@@ -4,10 +4,10 @@ RLBPPred is a command-line tool for ranking proteins as candidate R-loop-binding
 
 ## Installation
 
-Use Python 3.10–3.13. To get the standalone PDB input option, install from the `main` branch as shown below; the v0.2.1 release does not include it.
+Use Python 3.10–3.13. Install [v0.3.0](https://github.com/callmest/RLBPPred/releases/tag/v0.3.0) from source to run the bundled examples:
 
 ```bash
-git clone https://github.com/callmest/RLBPPred.git
+git clone --branch v0.3.0 --depth 1 https://github.com/callmest/RLBPPred.git
 cd RLBPPred
 python -m venv .venv
 source .venv/bin/activate

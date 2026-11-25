@@ -1,6 +1,6 @@
 # Fixed assets and offline setup
 
-This source checkout and the released v0.2.1 software use the same pretrained
+Software v0.3.0 and v0.2.1 use the same pretrained
 assets. The frozen MLP files are in **model release v0.2.0** in
 [callmest/RLBPPred](https://github.com/callmest/RLBPPred);
 their file contents, sizes and hashes are unchanged. Training and paper

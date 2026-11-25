@@ -2,8 +2,7 @@
 
 Maintainer and publisher: callmest. Model ID: `strict-saprot-af2-mlp-v1`.
 
-This development checkout uses the same pretrained files as software
-[v0.2.1](https://github.com/callmest/RLBPPred/releases/tag/v0.2.1), from
+Software v0.3.0 uses the same pretrained files as v0.2.1, from
 [model release v0.2.0](https://github.com/callmest/RLBPPred/releases/tag/v0.2.0).
 Training and paper reproduction are in
 [callmest/RLBPPred-paper-code](https://github.com/callmest/RLBPPred-paper-code).
